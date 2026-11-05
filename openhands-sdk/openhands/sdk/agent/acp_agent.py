@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -501,6 +502,24 @@ def _log_acp_provider_version(agent_name: str, agent_version: str) -> None:
             agent_name,
             agent_version,
         )
+
+
+def _resolve_executable(command: str, env: dict[str, str] | None = None) -> str:
+    """Resolve *command* to a path Windows can actually open.
+
+    Node-based providers launch through npm shims (``npx``, ``claude-agent-acp``,
+    …), which are extension-less batch files on Windows, and an exec-style spawn
+    only appends ``.exe`` there — so the bare name dies with ``FileNotFoundError
+    [WinError 2]`` before the ACP handshake. ``shutil.which`` searches the PATH
+    the child is about to get (``env``) and applies ``PATHEXT``, which finds the
+    ``.cmd``. A name that does not resolve is returned unchanged so a genuinely
+    missing binary still reports ``ACPSpawnError`` (see
+    :func:`_classify_acp_init_error`). No-op on every other platform, where the
+    shim is a real executable.
+    """
+    if sys.platform != "win32":
+        return command
+    return shutil.which(command, path=(env or {}).get("PATH")) or command
 
 
 def _npx_packages(command: list[str]) -> list[str]:
@@ -2635,7 +2654,7 @@ class ACPAgent(AgentBase):
         )
         package_args = [arg for package in packages for arg in ("--package", package)]
         process = await asyncio.create_subprocess_exec(
-            "npx",
+            _resolve_executable("npx", env),
             "--yes",
             "--prefer-offline",
             *package_args,
@@ -3132,7 +3151,7 @@ class ACPAgent(AgentBase):
             # ACP servers (e.g. claude-code-acp v0.1.x) write to
             # stdout.
             process = await asyncio.create_subprocess_exec(
-                command,
+                _resolve_executable(command, env),
                 *args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,

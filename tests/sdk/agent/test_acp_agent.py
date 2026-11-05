@@ -47,6 +47,7 @@ from openhands.sdk.agent.acp_agent import (
     _OpenHandsACPBridge,
     _preconfigured_credentials,
     _reapply_session_model_on_resume,
+    _resolve_executable,
     _select_auth_method,
     _serialize_tool_content,
     _stringify_acp_error_data,
@@ -233,6 +234,9 @@ async def test_warm_npx_cache_passes_every_pinned_package(tmp_path):
     process = MagicMock()
     process.returncode = 0
     process.wait = AsyncMock(return_value=0)
+    # npx is deliberately absent from the child PATH so the argv below is the
+    # bare name; resolution itself is covered by test_resolve_executable_*.
+    env = {"PATH": str(tmp_path / "empty-bin")}
 
     with patch(
         "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
@@ -241,7 +245,7 @@ async def test_warm_npx_cache_passes_every_pinned_package(tmp_path):
         await agent._warm_npx_cache(
             ["adapter-acp@1.2.3", "@scope/engine@4.5.6"],
             "two-package",
-            {},
+            env,
             str(tmp_path),
         )
 
@@ -263,7 +267,12 @@ async def test_warm_npx_cache_uses_prefer_offline_and_durable_env(tmp_path):
     process = MagicMock()
     process.returncode = 0
     process.wait = AsyncMock(return_value=0)
-    env = {"npm_config_cache": str(tmp_path / "npm-cache")}
+    env = {
+        # see test_warm_npx_cache_passes_every_pinned_package: npx stays off the
+        # child PATH here so this test pins the argv/transport, not resolution.
+        "PATH": str(tmp_path / "empty-bin"),
+        "npm_config_cache": str(tmp_path / "npm-cache"),
+    }
 
     with patch(
         "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
@@ -289,6 +298,101 @@ async def test_warm_npx_cache_uses_prefer_offline_and_durable_env(tmp_path):
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
+
+
+def test_resolve_executable_finds_the_cmd_shim_on_windows(monkeypatch):
+    """Windows: CreateProcess only appends ``.exe``, so a bare npm shim name
+    (``npx`` -> ``npx.cmd`` on disk) dies with WinError 2 before the handshake.
+    The PATHEXT match is used instead, looked up in the child's PATH."""
+    seen: list[tuple[str, str | None]] = []
+
+    def _which(command: str, path: str | None = None, **_kw: Any) -> str | None:
+        seen.append((command, path))
+        return r"C:\node\npx.CMD"
+
+    monkeypatch.setattr(acp_agent_module.sys, "platform", "win32")
+    monkeypatch.setattr(acp_agent_module.shutil, "which", _which)
+
+    assert _resolve_executable("npx", {"PATH": r"C:\node"}) == r"C:\node\npx.CMD"
+    assert seen == [("npx", r"C:\node")], "must search the env PATH, not the parent's"
+
+
+def test_resolve_executable_is_untouched_off_windows(monkeypatch):
+    """macOS/Linux ship the shim as a real executable: rewriting there would
+    only mask a PATH problem, so nothing is looked up at all."""
+    which = MagicMock()
+    monkeypatch.setattr(acp_agent_module.sys, "platform", "linux")
+    monkeypatch.setattr(acp_agent_module.shutil, "which", which)
+
+    assert _resolve_executable("npx", {"PATH": "/usr/local/bin"}) == "npx"
+    which.assert_not_called()
+
+
+def test_resolve_executable_keeps_an_unresolvable_name(monkeypatch):
+    """A genuinely missing CLI keeps its original name so the spawn still fails
+    the same way and is still reported as ACPSpawnError (not a silent no-op)."""
+    monkeypatch.setattr(acp_agent_module.sys, "platform", "win32")
+    monkeypatch.setattr(acp_agent_module.shutil, "which", lambda *_a, **_k: None)
+
+    assert (
+        _resolve_executable("claude-agent-acp", {"PATH": r"C:\empty"})
+        == "claude-agent-acp"
+    )
+    assert (
+        _classify_acp_init_error(
+            FileNotFoundError(2, "The system cannot find the file specified")
+        )
+        == "ACPSpawnError"
+    )
+
+
+async def test_warm_npx_cache_spawns_the_resolved_shim(tmp_path, monkeypatch):
+    """The npx cache warm is the other ACP spawn site; on Windows it has the
+    same shim problem, so it must warm through the resolved path too."""
+    agent = _make_agent()
+    process = MagicMock()
+    process.returncode = 0
+    process.wait = AsyncMock(return_value=0)
+    monkeypatch.setattr(acp_agent_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        acp_agent_module.shutil, "which", lambda *_a, **_k: r"C:\node\npx.CMD"
+    )
+
+    with patch(
+        "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ) as create_process:
+        await agent._warm_npx_cache(
+            ["@agentclientprotocol/codex-acp@1.10.0"],
+            "codex",
+            {"PATH": r"C:\node"},
+            str(tmp_path),
+        )
+
+    assert create_process.await_args is not None
+    assert create_process.await_args.args[0] == r"C:\node\npx.CMD"
+
+
+def test_start_acp_server_resolves_the_command_before_spawning(tmp_path):
+    """The launch command is resolved once, with the assembled child env: the
+    spawn gets the resolved path while provider detection and the codex env
+    translation keep seeing the command the user configured."""
+    agent = ACPAgent(acp_command=["claude-agent-acp", "--stdio"])
+    state = _make_state(tmp_path)
+    seen: list[tuple[str, dict[str, str]]] = []
+    resolve = acp_agent_module._resolve_executable
+
+    def _spy(command: str, env: dict[str, str] | None = None) -> str:
+        seen.append((command, env or {}))
+        return resolve(command, env)
+
+    with patch.object(acp_agent_module, "_resolve_executable", new=_spy):
+        TestACPSessionIdPersistence._patched_start_acp_server(
+            agent, state, conn=TestACPSessionIdPersistence._make_conn()
+        )
+
+    assert [command for command, _env in seen] == ["claude-agent-acp"]
+    assert "PATH" in seen[0][1], "must resolve against the env the child gets"
 
 
 def test_npx_cache_warm_failure_continues_with_normal_startup(tmp_path, caplog):
