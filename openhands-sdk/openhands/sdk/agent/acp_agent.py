@@ -1524,6 +1524,13 @@ class _OpenHandsACPBridge:
             # Store the update for step()/ask_agent() to process in one place.
             self._context_window = update.size
             self._context_window_by_session[session_id] = update.size
+            # Within a turn, only a frame with a positive ``used`` describes the
+            # context: claude-agent-acp closes compaction with ``used: 0``
+            # placeholders, so inherit the last real reading instead of letting a
+            # later zero overwrite it. ``size`` still comes from the newest frame.
+            previous = self._turn_usage_updates.get(session_id)
+            if not update.used and previous is not None and previous.used:
+                update = update.model_copy(update={"used": previous.used})
             self._turn_usage_updates[session_id] = update
             event = self._usage_received.get(session_id)
             if event is not None:
@@ -2143,11 +2150,17 @@ class ACPAgent(AgentBase):
                 ),
                 response_id=session_id,
             )
-            if usage_update is not None:
-                self.llm.metrics.token_usages[-1].per_turn_token = usage_update.used
+            # ``used`` is the tokens currently in context, while what
+            # add_token_usage just wrote is input+output — for a turn that made
+            # several LLM calls that is their SUM (issue #5687). A frame without a
+            # positive ``used`` (claude-agent-acp emits used=0 placeholders on
+            # compact_boundary) keeps the fallback instead of zeroing the meter.
+            context_used = usage_update.used if usage_update is not None else 0
+            if context_used:
+                self.llm.metrics.token_usages[-1].per_turn_token = context_used
                 accumulated = self.llm.metrics.accumulated_token_usage
                 assert accumulated is not None
-                accumulated.per_turn_token = usage_update.used
+                accumulated.per_turn_token = context_used
 
         # -- Cost derivation from tokens --------------------------------------
         # gemini-cli: no UsageUpdate cost, so derive from token counts using

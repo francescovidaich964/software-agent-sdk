@@ -3818,19 +3818,25 @@ class TestACPAgentTelemetry:
         def _fake_run_async(_coro, **_kwargs):
             mock_client.accumulated_text.append("response text")
             if cost is not None or context_used is not None:
-                mock_update = UsageUpdate(
-                    session_update="usage_update",
-                    used=context_used if context_used is not None else 0,
-                    size=cost[1] if cost is not None else 200000,
-                    cost=ACPCost(amount=cost[0], currency="USD")
-                    if cost is not None
-                    else None,
+                # context_used may be a list, i.e. several usage_update frames in
+                # one turn; they go through the real notification handler.
+                used_frames = (
+                    context_used if isinstance(context_used, list) else [context_used]
                 )
-                mock_client._turn_usage_updates["test-session"] = mock_update
-                mock_client._context_window_by_session["test-session"] = (
-                    mock_update.size
-                )
-                mock_client._context_window = mock_update.size
+                for used in used_frames:
+                    asyncio.run(
+                        mock_client.session_update(
+                            "test-session",
+                            UsageUpdate(
+                                session_update="usage_update",
+                                used=used or 0,
+                                size=cost[1] if cost is not None else 200000,
+                                cost=ACPCost(amount=cost[0], currency="USD")
+                                if cost is not None
+                                else None,
+                            ),
+                        )
+                    )
             return mock_response
 
         mock_executor = MagicMock()
@@ -3866,15 +3872,24 @@ class TestACPAgentTelemetry:
         assert usage.context_window == 200000
 
     @pytest.mark.parametrize(
-        ("usage", "context_used"),
+        ("usage", "context_used", "expected_per_turn"),
         [
-            ({"input": 1300000, "output": 1000}, 46000),
-            ({"input": 100, "output": 50}, 0),
-            (None, 46000),
-            ({"input": 0, "output": 0}, 46000),
+            # (PromptResponse.usage, UsageUpdate.used, expected per_turn_token)
+            ({"input": 1300000, "output": 1000}, 46000, 46000),
+            # Measured with opencode 2.2.5 on a turn of two LLM calls: ``used`` is
+            # the context of the last call, PromptResponse.usage is the SUM of
+            # both calls (31258+60+81 + 34396+73+59 -> 65654 vs 34528).
+            ({"input": 65654, "output": 133}, 34528, 34528),
+            ({"input": 100, "output": 50}, [34528, 0], 34528),
+            ({"input": 100, "output": 50}, 0, 150),
+            ({"input": 100, "output": 50}, None, 150),
+            (None, 46000, 46000),
+            ({"input": 0, "output": 0}, 46000, 46000),
         ],
     )
-    def test_step_records_context_fill(self, tmp_path, usage, context_used):
+    def test_step_records_context_fill(
+        self, tmp_path, usage, context_used, expected_per_turn
+    ):
         agent, conversation = self._make_step_fixtures(
             tmp_path, usage=usage, context_used=context_used
         )
@@ -3885,7 +3900,7 @@ class TestACPAgentTelemetry:
         assert len(metrics.token_usages) == 1
         assert metrics.accumulated_token_usage is not None
         for recorded in (metrics.token_usages[-1], metrics.accumulated_token_usage):
-            assert recorded.per_turn_token == context_used
+            assert recorded.per_turn_token == expected_per_turn
             assert recorded.context_window == 200000
             assert recorded.prompt_tokens == (usage["input"] if usage else 0)
             assert recorded.completion_tokens == (usage["output"] if usage else 0)
@@ -4035,6 +4050,7 @@ class TestACPAgentTelemetry:
         usage_event = client.prepare_usage_sync("sess-1")
 
         update = MagicMock(spec=UsageUpdate)
+        update.used = 46000
         update.size = 128000
         update.cost = MagicMock()
         update.cost.amount = 0.05
@@ -4054,6 +4070,7 @@ class TestACPAgentTelemetry:
         client = _OpenHandsACPBridge()
 
         update = MagicMock(spec=UsageUpdate)
+        update.used = 46000
         update.size = 200000
         update.cost = None
 
