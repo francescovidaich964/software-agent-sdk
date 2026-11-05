@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from acp.exceptions import RequestError as ACPRequestError
-from acp.schema import NewSessionResponse, PromptResponse
+from acp.schema import Cost as ACPCost, NewSessionResponse, PromptResponse, UsageUpdate
 from pydantic import SecretStr
 
 import openhands.sdk.agent.acp_agent as acp_agent_module
@@ -3894,7 +3894,9 @@ class TestACPAgentTelemetry:
         assert llms[0] is agent.llm
         assert llms[0].model == "acp-managed"
 
-    def _make_step_fixtures(self, tmp_path, agent=None, usage=None, cost=None):
+    def _make_step_fixtures(
+        self, tmp_path, agent=None, usage=None, cost=None, context_used=None
+    ):
         """Set up agent + client + executor for step() telemetry tests."""
         if agent is None:
             agent = _make_agent()
@@ -3921,14 +3923,26 @@ class TestACPAgentTelemetry:
 
         def _fake_run_async(_coro, **_kwargs):
             mock_client.accumulated_text.append("response text")
-            if cost is not None:
-                mock_update = MagicMock()
-                mock_update.cost = MagicMock()
-                mock_update.cost.amount = cost[0]
-                mock_update.size = cost[1]
-                mock_client._turn_usage_updates["test-session"] = mock_update
-                mock_client._context_window_by_session["test-session"] = cost[1]
-                mock_client._context_window = cost[1]
+            if cost is not None or context_used is not None:
+                # context_used may be a list, i.e. several usage_update frames in
+                # one turn; they go through the real notification handler.
+                used_frames = (
+                    context_used if isinstance(context_used, list) else [context_used]
+                )
+                for used in used_frames:
+                    asyncio.run(
+                        mock_client.session_update(
+                            "test-session",
+                            UsageUpdate(
+                                session_update="usage_update",
+                                used=used or 0,
+                                size=cost[1] if cost is not None else 200000,
+                                cost=ACPCost(amount=cost[0], currency="USD")
+                                if cost is not None
+                                else None,
+                            ),
+                        )
+                    )
             return mock_response
 
         mock_executor = MagicMock()
@@ -3963,6 +3977,41 @@ class TestACPAgentTelemetry:
         assert usage.reasoning_tokens == 20
         assert usage.context_window == 200000
 
+    @pytest.mark.parametrize(
+        ("usage", "context_used", "expected_per_turn"),
+        [
+            # (PromptResponse.usage, UsageUpdate.used, expected per_turn_token)
+            ({"input": 1300000, "output": 1000}, 46000, 46000),
+            # Measured with opencode 2.2.5 on a turn of two LLM calls: ``used`` is
+            # the context of the last call, PromptResponse.usage is the SUM of
+            # both calls (31258+60+81 + 34396+73+59 -> 65654 vs 34528).
+            ({"input": 65654, "output": 133}, 34528, 34528),
+            ({"input": 100, "output": 50}, [34528, 0], 34528),
+            ({"input": 100, "output": 50}, 0, 150),
+            ({"input": 100, "output": 50}, None, 150),
+            (None, 46000, 46000),
+            ({"input": 0, "output": 0}, 46000, 46000),
+        ],
+    )
+    def test_step_records_context_fill(
+        self, tmp_path, usage, context_used, expected_per_turn
+    ):
+        agent, conversation = self._make_step_fixtures(
+            tmp_path, usage=usage, context_used=context_used
+        )
+
+        agent.step(conversation, on_event=lambda _: None)
+
+        metrics = agent.llm.metrics
+        assert len(metrics.token_usages) == 1
+        assert metrics.accumulated_token_usage is not None
+        for recorded in (metrics.token_usages[-1], metrics.accumulated_token_usage):
+            assert recorded.per_turn_token == expected_per_turn
+            assert recorded.context_window == 200000
+            assert recorded.prompt_tokens == (usage["input"] if usage else 0)
+            assert recorded.completion_tokens == (usage["output"] if usage else 0)
+        assert metrics.accumulated_cost == 0.0
+
     def test_step_handles_no_usage(self, tmp_path):
         """step() handles PromptResponse with no usage gracefully."""
         agent, conversation = self._make_step_fixtures(tmp_path)
@@ -3994,6 +4043,7 @@ class TestACPAgentTelemetry:
             agent=agent,
             usage={"input": 100, "output": 50},
             cost=(0.05, 128000),
+            context_used=100,
         )
         agent.step(conversation1, on_event=lambda _: None)
         assert agent.llm.metrics.accumulated_cost == pytest.approx(0.05)
@@ -4003,10 +4053,17 @@ class TestACPAgentTelemetry:
             agent=agent,
             usage={"input": 200, "output": 100},
             cost=(0.12, 130000),
+            context_used=70,
         )
         agent.step(conversation2, on_event=lambda _: None)
         assert agent.llm.metrics.accumulated_cost == pytest.approx(0.12)
         assert len(agent.llm.metrics.costs) == 2
+        accumulated = agent.llm.metrics.accumulated_token_usage
+        assert accumulated is not None
+        assert accumulated.prompt_tokens == 300
+        assert accumulated.completion_tokens == 150
+        assert accumulated.per_turn_token == 70
+        assert agent.llm.metrics.token_usages[-1].per_turn_token == 70
 
     def test_step_no_cost_when_usage_update_missing(self, tmp_path):
         """No cost is recorded when PromptResponse arrives without UsageUpdate."""
@@ -4021,6 +4078,9 @@ class TestACPAgentTelemetry:
         assert agent.llm.metrics.accumulated_cost == 0.0
         assert len(agent.llm.metrics.costs) == 0
         assert len(agent.llm.metrics.token_usages) == 1
+        assert agent.llm.metrics.token_usages[0].per_turn_token == 150
+        assert agent.llm.metrics.accumulated_token_usage is not None
+        assert agent.llm.metrics.accumulated_token_usage.per_turn_token == 150
 
     def test_step_records_partial_metrics_on_usage_timeout(self, tmp_path, caplog):
         """Timeout waiting for UsageUpdate logs warning but records token metrics."""
@@ -4096,6 +4156,7 @@ class TestACPAgentTelemetry:
         usage_event = client.prepare_usage_sync("sess-1")
 
         update = MagicMock(spec=UsageUpdate)
+        update.used = 46000
         update.size = 128000
         update.cost = MagicMock()
         update.cost.amount = 0.05
@@ -4115,6 +4176,7 @@ class TestACPAgentTelemetry:
         client = _OpenHandsACPBridge()
 
         update = MagicMock(spec=UsageUpdate)
+        update.used = 46000
         update.size = 200000
         update.cost = None
 
