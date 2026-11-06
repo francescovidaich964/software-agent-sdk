@@ -478,6 +478,25 @@ class FileUploadResult(Success):
     file_size: int = Field(description="Number of bytes written to the destination")
 
 
+class DeleteConversationResponse(Success):
+    """Delete result plus what happened to the agent's own copy of the session."""
+
+    acp_session_deleted: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the agent's own session was deleted with the conversation: "
+            "true = deleted, false = the agent was asked and it failed, null = not "
+            "an ACP conversation or the agent does not support session/delete."
+        ),
+    )
+    acp_session_delete_error: str | None = Field(
+        default=None,
+        description=(
+            "Short reason for the failure, set only when acp_session_deleted is false."
+        ),
+    )
+
+
 class EventPage(OpenHandsModel):
     items: list[Event]
     next_page_id: str | None = None

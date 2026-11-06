@@ -41,6 +41,7 @@ from openhands.agent_server.models import (
     ConversationRuntimeInfo,
     ConversationRuntimeStatus,
     ConversationSortOrder,
+    DeleteConversationResponse,
     ForkConversationRequest,
     NavigateConversationRequest,
     SetConfirmationPolicyRequest,
@@ -403,12 +404,21 @@ async def interrupt_conversation(
 async def delete_conversation(
     conversation_id: UUID,
     conversation_service: ConversationService = Depends(get_conversation_service),
-) -> Success:
-    """Permanently delete a conversation."""
-    deleted = await conversation_service.delete_conversation(conversation_id)
-    if not deleted:
+) -> DeleteConversationResponse:
+    """Permanently delete a conversation.
+
+    The response also says whether the agent's own session went away with it, so
+    a client can tell the user that the agent kept its copy.
+    """
+    result = await conversation_service.delete_conversation_with_outcome(
+        conversation_id
+    )
+    if not result.deleted:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
-    return Success()
+    return DeleteConversationResponse(
+        acp_session_deleted=result.acp_session_deleted,
+        acp_session_delete_error=result.acp_session_delete_error,
+    )
 
 
 @conversation_router.post(

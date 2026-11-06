@@ -10860,3 +10860,109 @@ class TestACPProtocolVersion:
         assert answered_v1 == answered_v2
         assert answered_v1["session_id"] == "sess-v"
         assert answered_v1["handshake"][0] == "initialize"
+
+
+# ---------------------------------------------------------------------------
+class TestDeleteAcpSessionIfSupported:
+    """``ACPAgent.delete_acp_session_if_supported`` — agent-side half of #40."""
+
+    @staticmethod
+    def _live_agent(session_id: str = "ses-1", *, supported: bool = True):
+        """An agent with a fake live connection whose requests we record."""
+        calls: list = []
+
+        async def _send(method, params):
+            calls.append((method, params))
+
+        agent = _make_agent()
+        conn = MagicMock()
+        conn.send_request = _send
+        agent._conn = conn
+        agent._session_id = session_id
+        agent._session_delete_supported = supported
+        executor = MagicMock()
+        executor.run_async = lambda fn, **_kwargs: asyncio.run(fn())
+        agent._executor = executor
+        return agent, calls
+
+    def test_sends_raw_session_delete_for_current_session(self):
+        agent, calls = self._live_agent("ses-42")
+
+        assert agent.delete_acp_session_if_supported() == "deleted"
+        assert calls == [("session/delete", {"sessionId": "ses-42"})]
+
+    def test_explicit_session_id_wins_over_current_one(self):
+        agent, calls = self._live_agent("ses-current")
+
+        assert agent.delete_acp_session_if_supported("ses-other") == "deleted"
+        assert calls == [("session/delete", {"sessionId": "ses-other"})]
+
+    def test_capability_absent_sends_nothing(self):
+        agent, calls = self._live_agent(supported=False)
+
+        assert agent.delete_acp_session_if_supported().startswith("skipped")
+        assert calls == []
+
+    def test_no_session_id_is_skipped(self):
+        agent, calls = self._live_agent()
+        agent._session_id = None
+
+        assert agent.delete_acp_session_if_supported().startswith("skipped")
+        assert calls == []
+
+    def test_agent_error_is_reported_not_raised(self):
+        agent, _ = self._live_agent()
+        agent._executor.run_async = MagicMock(side_effect=RuntimeError("boom"))
+
+        assert agent.delete_acp_session_if_supported().startswith("failed")
+
+    def test_timeout_is_reported_not_raised(self):
+        agent, _ = self._live_agent()
+        agent._executor.run_async = MagicMock(side_effect=TimeoutError())
+
+        assert agent.delete_acp_session_if_supported(timeout=0.1).startswith("failed")
+
+    def test_stopped_agent_without_state_is_skipped(self):
+        """No state means no way to start the agent, so nothing is spawned."""
+        agent = _make_agent()
+
+        assert agent.delete_acp_session_if_supported("ses-1").startswith("skipped")
+
+    def test_stopped_agent_starts_transiently_and_is_closed_again(self, tmp_path):
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        calls: list = []
+
+        async def _send(method, params):
+            calls.append((method, params))
+
+        conn = MagicMock()
+        conn.send_request = _send
+
+        def _fake_init(_self, _state, on_event):
+            _self._conn = conn
+            _self._session_delete_supported = True
+            executor = MagicMock()
+            executor.run_async = lambda fn, **_kwargs: asyncio.run(fn())
+            _self._executor = executor
+
+        with (
+            patch.object(ACPAgent, "init_state", autospec=True, side_effect=_fake_init),
+            patch.object(ACPAgent, "close", autospec=True) as mock_close,
+        ):
+            outcome = agent.delete_acp_session_if_supported("ses-7", state=state)
+
+        assert outcome == "deleted"
+        assert calls == [("session/delete", {"sessionId": "ses-7"})]
+        mock_close.assert_called_once()
+
+    def test_failed_transient_start_is_reported_not_raised(self, tmp_path):
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+
+        with patch.object(
+            ACPAgent, "init_state", autospec=True, side_effect=RuntimeError("no spawn")
+        ):
+            assert agent.delete_acp_session_if_supported(
+                "ses-1", state=state
+            ).startswith("failed")
