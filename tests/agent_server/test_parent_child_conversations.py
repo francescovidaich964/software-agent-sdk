@@ -390,6 +390,10 @@ async def test_start_child_conversation_inherits_parent_configuration(
     child_stored = launch.services[launch.result.conversation_id].stored
     assert child_stored.tags == {"source": "test"}
     assert child_stored.title == "Docs"
+    # The name came with the request, so it is the user's: the copy inherits the
+    # parent's metadata and an agent must not replace a title the parent did not
+    # carry. ``model_copy`` skips validators, so this has to be stated.
+    assert child_stored.title_source == "user"
     assert launch.result.title == "Docs"
 
 

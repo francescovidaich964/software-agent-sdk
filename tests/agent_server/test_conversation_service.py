@@ -3677,6 +3677,27 @@ class TestAutoTitle:
         service.save_meta.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_autotitle_records_that_the_server_wrote_the_title(self):
+        """Provenance has to be written, not inferred: ``meta.json`` is read back
+        with ``model_validate_json``, where nothing can tell a generated title
+        from one the user typed. Without this the agent can never rename a
+        conversation again after the first reload."""
+        service = self._make_service()
+
+        with patch(self._GENERATE_TITLE_PATH, return_value="Generated Title"):
+            subscriber = AutoTitleSubscriber(service=service)
+            await subscriber(self._user_message_event())
+            await self._drain_title_task(lambda: service.stored.title is not None)
+
+        assert service.stored.title_source == "auto"
+        assert (
+            StoredConversation.model_validate_json(
+                service.stored.model_dump_json()
+            ).title_source
+            == "auto"
+        )
+
+    @pytest.mark.asyncio
     async def test_autotitle_passes_custom_prompt_to_title_generation(self):
         service = self._make_service(prompt="Use {conversation_content} as the title.")
 
@@ -4185,9 +4206,18 @@ class TestACPSessionTitleAdoption:
 
     @staticmethod
     def _generated(title: str) -> StoredConversation:
-        """The auto-title shape: ``AutoTitleSubscriber`` writes it with
-        ``model_copy``, which skips validators, so it carries no provenance."""
-        return TestACPSessionTitleAdoption._stored().model_copy(update={"title": title})
+        """The shape ``AutoTitleSubscriber`` persists: a server-written title
+        that says so, because a title with no provenance cannot be told from a
+        rename once ``meta.json`` is read back."""
+        return TestACPSessionTitleAdoption._stored().model_copy(
+            update={"title": title, "title_source": "auto"}
+        )
+
+    @staticmethod
+    def _reloaded(stored: StoredConversation) -> StoredConversation:
+        """``stored`` as the next process sees it: ``meta.json`` as the service
+        writes it, read back the way ``EventService`` reads it."""
+        return StoredConversation.model_validate_json(stored.model_dump_json())
 
     @staticmethod
     def _service(stored: StoredConversation) -> AsyncMock:
@@ -4196,17 +4226,13 @@ class TestACPSessionTitleAdoption:
         _adopt_saved_meta(service)
         return service
 
-    def test_a_title_supplied_at_creation_is_the_users(self):
-        """A conversation created or forked with a title states no provenance,
-        and so does an older ``meta.json``: both are treated as the user's."""
+    def test_loading_a_title_never_invents_provenance(self):
+        """An ``after`` validator also runs on ``model_validate_json``, which is
+        how ``meta.json`` is loaded, so guessing ``user`` here would relabel every
+        server-written title on the first reload and shield it forever."""
         stored = self._stored().model_copy(update={"title": "Chosen at creation"})
 
-        assert (
-            StoredConversation.model_validate(
-                json.loads(stored.model_dump_json())
-            ).title_source
-            == "user"
-        )
+        assert self._reloaded(stored).title_source is None
 
     @pytest.mark.asyncio
     async def test_agent_title_is_adopted_over_a_generated_one(self):
@@ -4217,6 +4243,18 @@ class TestACPSessionTitleAdoption:
         assert service.stored.title == "Renamed by Claude"
         assert service.stored.title_source == "agent"
         service.save_meta.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_an_auto_title_is_still_adopted_after_a_reload(self):
+        """An agent re-publishes its title on every resume, so adoption has to
+        keep working after the auto-title has been through ``meta.json``: that is
+        the whole life of a conversation the agent renames after a restart."""
+        service = self._service(self._reloaded(self._generated("Fix the login bug")))
+
+        await EventService._adopt_acp_session_title(service, "Renamed by Claude")
+
+        assert service.stored.title == "Renamed by Claude"
+        assert service.stored.title_source == "agent"
 
     @pytest.mark.asyncio
     async def test_agent_title_is_adopted_when_there_is_none_yet(self):
@@ -4239,16 +4277,36 @@ class TestACPSessionTitleAdoption:
         service.save_meta.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_a_user_title_is_never_replaced(self):
-        stored = self._stored().model_copy(update={"title": "My own name"})
-        service = self._service(
-            StoredConversation.model_validate(json.loads(stored.model_dump_json()))
+    async def test_a_user_rename_is_still_protected_after_a_reload(self):
+        """``update_conversation`` is the only writer of ``user``, so protecting
+        it has to work off the value read back from ``meta.json``, not off a
+        value inferred while loading."""
+        stored = self._stored().model_copy(
+            update={"title": "My own name", "title_source": "user"}
         )
+        service = self._service(self._reloaded(stored))
         assert service.stored.title_source == "user"
 
         await EventService._adopt_acp_session_title(service, "Renamed by Claude")
 
         assert service.stored.title == "My own name"
+        assert service.stored.title_source == "user"
+        service.save_meta.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_title_of_unknown_provenance_is_left_alone(self):
+        """A ``meta.json`` written before ``title_source`` existed says nothing
+        about who typed the title. Replacing it could silently overwrite a rename
+        the user made before the upgrade, so unknown is treated like ``user``."""
+        legacy = json.loads(self._stored().model_dump_json())
+        legacy["title"] = "Renamed before the upgrade"
+        legacy.pop("title_source")
+        service = self._service(StoredConversation.model_validate(legacy))
+        assert service.stored.title_source is None
+
+        await EventService._adopt_acp_session_title(service, "Renamed by Claude")
+
+        assert service.stored.title == "Renamed before the upgrade"
         service.save_meta.assert_not_called()
 
     @pytest.mark.asyncio
@@ -4431,13 +4489,17 @@ class TestConversationTreeForkAndNavigate:
                 svc, workspace_dir, ["first", "second"]
             )
 
-            fork_info = await svc.fork_conversation(info.id)
+            fork_info = await svc.fork_conversation(info.id, title="Named fork")
 
             assert fork_info is not None
             assert fork_info.forked_from_conversation_id == info.id
             assert fork_info.forked_from_event_id is None
             fork_service = await svc.get_event_service(fork_info.id)
             assert fork_service is not None
+            # The name came from the fork request, so it is the user's even though
+            # the source's title was the server's own (model_copy keeps no trace).
+            assert fork_service.stored.title == "Named fork"
+            assert fork_service.stored.title_source == "user"
             fork_events = _branch_events(fork_service.get_conversation())
             assert len(fork_events) == len(events)
 

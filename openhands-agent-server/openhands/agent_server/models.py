@@ -6,7 +6,7 @@ from enum import Enum, StrEnum
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 from openhands.sdk.agent.acp_models import ACPModelInfo
 from openhands.sdk.agent.base import AgentBase
@@ -119,14 +119,18 @@ class StoredConversation(ConversationConfig):
     title: str | None = Field(
         default=None, description="User-defined title for the conversation"
     )
-    title_source: Literal["user", "agent"] | None = Field(
+    title_source: Literal["user", "agent", "auto"] | None = Field(
         default=None,
         description=(
-            "Who set ``title``: ``user`` for a rename from the UI (or a title a "
-            "request supplied at creation), ``agent`` for one the conversation's "
-            "ACP agent published for its session. ``None`` means this server "
-            "generated it from the first message, which an agent-published title "
-            "may replace. Only ``user`` is protected from an agent rename."
+            "Who set ``title``: ``user`` for a rename from the UI or a title a "
+            "fork / child-conversation request supplied, ``agent`` for one the "
+            "conversation's ACP agent published for its session, ``auto`` for one "
+            "this server generated from the first message. ``None`` means the "
+            "provenance is unknown - a title written before this field existed - "
+            "and it is treated like ``user``: nothing may replace it. Every writer "
+            "states its own provenance and loading never infers one, because "
+            "``meta.json`` is read back with ``model_validate_json`` and a guess "
+            "there would relabel a server-written title on the first reload."
         ),
     )
     metrics: MetricsSnapshot | None = None
@@ -156,16 +160,6 @@ class StoredConversation(ConversationConfig):
             "`agent_settings`."
         ),
     )
-
-    @model_validator(mode="after")
-    def _title_without_provenance_is_the_users(self) -> StoredConversation:
-        # A title that arrives with no provenance came from a create/fork
-        # request or from an older meta.json, so treat it as the user's. The
-        # auto-title path writes with ``model_copy``, which skips validators,
-        # and so stays replaceable by an agent-published title.
-        if self.title is not None and self.title_source is None:
-            self.title_source = "user"
-        return self
 
 
 class _ConversationInfoBase(BaseModel):
