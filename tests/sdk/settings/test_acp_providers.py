@@ -57,6 +57,12 @@ class TestACPProviderInfo:
         assert info.supports_set_session_model is True
         assert info.supports_runtime_model_switch is True
         assert info.session_meta_key == "claudeCode"
+        # Adapter contract, read off claude-agent-acp 0.99.1: it publishes the
+        # option as ``EFFORT_CONFIG_ID = "effort"`` (dist/session-config-ids.js)
+        # and its bundled @anthropic-ai/claude-agent-sdk declares
+        # ``EffortLevel = 'low'|'medium'|'high'|'xhigh'|'max'`` (sdk.d.ts).
+        assert info.effort_config_id == "effort"
+        assert info.effort_levels == ("low", "medium", "high", "xhigh", "max")
         # Pinned binary exposed by the agent-server image wrappers.
         assert info.binary_name == "claude-agent-acp"
         assert info.data_dir_env_var == "CLAUDE_CONFIG_DIR"
@@ -385,6 +391,12 @@ class TestBuildSessionModelMeta:
     def test_claude_uses_meta_key(self):
         result = build_session_model_meta("claude-agent-acp v0.29.0", "claude-opus-4")
         assert result == {"claudeCode": {"options": {"model": "claude-opus-4"}}}
+
+    def test_claude_splits_effort(self):
+        result = build_session_model_meta("claude-agent-acp", "opus[1m]/high")
+        assert result == {
+            "claudeCode": {"options": {"model": "opus[1m]", "effort": "high"}}
+        }
 
     def test_codex_returns_empty(self):
         result = build_session_model_meta("codex-acp", "gpt-4o")
