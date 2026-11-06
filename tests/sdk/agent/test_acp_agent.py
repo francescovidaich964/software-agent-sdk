@@ -8863,6 +8863,52 @@ class TestApplyAcpModel:
         assert conn.set_config_option.await_count == 2
         conn.set_session_model.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_legacy_branch_sends_base_model(self, caplog):
+        """``set_session_model`` carries a model id only, so a combined id is
+        split before it is sent: an older claude-agent-acp without
+        ``configOptions`` would otherwise be handed ``opus[1m]/high``, an id it
+        never listed, and the switch would fail or silently no-op.
+        """
+        conn = AsyncMock()
+        with caplog.at_level("DEBUG"):
+            await _apply_acp_model(
+                conn,
+                "sess-1",
+                "opus[1m]/high",
+                agent_name="claude-agent-acp",
+                via_config_option=False,
+            )
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="opus[1m]", session_id="sess-1"
+        )
+        conn.set_config_option.assert_not_called()
+        # The effort is lost on this path, so say so rather than hide it.
+        assert "dropping effort='high'" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_legacy_branch_only_splits_declared_efforts(self):
+        """Ids that merely contain a slash travel unchanged: an undeclared
+        suffix and a provider without efforts are not effort splits."""
+        conn = AsyncMock()
+        await _apply_acp_model(
+            conn,
+            "sess-1",
+            "provider/custom/model",
+            agent_name="claude-agent-acp",
+            via_config_option=False,
+        )
+        await _apply_acp_model(
+            conn,
+            "sess-1",
+            "gemini-2.5-pro/high",
+            agent_name="gemini-cli",
+            via_config_option=False,
+        )
+        assert [
+            c.kwargs["model_id"] for c in conn.set_session_model.await_args_list
+        ] == ["provider/custom/model", "gemini-2.5-pro/high"]
+
 
 class TestACPAgentAvailableModelsProperty:
     """``available_models`` exposes the server's model list verbatim.

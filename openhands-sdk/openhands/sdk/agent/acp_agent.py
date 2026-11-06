@@ -638,10 +638,11 @@ async def _apply_acp_model(
     The model id is normally the bare preset id listed by the server. Callers
     may still pass a combined id such as ``gpt-5.5/high`` or ``opus[1m]/high``;
     providers that declare an ``effort_config_id`` expose effort as a separate
-    config option, so split it only on the config-options mechanism. Effort is
-    applied after the model and best-effort: a server may reject it for a model
-    without effort support (claude-agent-acp drops the option for Haiku), and
-    that must not undo or misreport the model switch that already succeeded.
+    config option, applied after the model and best-effort: a server may reject
+    it for a model without effort support (claude-agent-acp drops the option for
+    Haiku), and that must not undo or misreport the model switch that already
+    succeeded. ``set_session_model`` has no channel for effort, so that path
+    switches to the base model and drops the suffix.
 
     agent-client-protocol 0.12.1 removed ``ClientSideConnection.set_session_model``;
     :class:`_ACPClientConnection` restores it, and a connection without it
@@ -668,7 +669,25 @@ async def _apply_acp_model(
                     e,
                 )
     elif supports_legacy_model_switch(conn):
-        await conn.set_session_model(model_id=model, session_id=session_id)  # type: ignore[attr-defined]
+        # ``set_session_model`` carries a model id and nothing else, so an effort
+        # suffix cannot travel this route: send the base model the server
+        # actually listed and note the effort that is being left behind.
+        provider = detect_acp_provider_by_agent_name(agent_name or "")
+        base_model, effort = (
+            provider.split_model_effort(model) if provider else (model, None)
+        )
+        if effort is not None:
+            logger.debug(
+                "ACP session %s selects its model with set_session_model, which "
+                "cannot carry an effort level: switching to %r, dropping "
+                "effort=%r",
+                session_id,
+                base_model,
+                effort,
+            )
+        await conn.set_session_model(  # type: ignore[attr-defined]
+            model_id=base_model, session_id=session_id
+        )
 
 
 def _extract_session_models(
