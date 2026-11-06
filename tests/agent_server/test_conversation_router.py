@@ -12,7 +12,10 @@ from pydantic import SecretStr
 from openhands.agent_server.config import Config
 from openhands.agent_server.conversation_registry import ConversationRegistry
 from openhands.agent_server.conversation_router import conversation_router
-from openhands.agent_server.conversation_service import ConversationService
+from openhands.agent_server.conversation_service import (
+    ConversationService,
+    DeleteConversationResult,
+)
 from openhands.agent_server.dependencies import get_conversation_service
 from openhands.agent_server.event_service import CondensationUnavailable, EventService
 from openhands.agent_server.launch import launch_source
@@ -1221,7 +1224,9 @@ def test_delete_conversation_success(
     """Test delete_conversation endpoint with successful deletion."""
 
     # Mock the service response - deletion successful
-    mock_conversation_service.delete_conversation.return_value = True
+    mock_conversation_service.delete_conversation_with_outcome.return_value = (
+        DeleteConversationResult(deleted=True)
+    )
 
     client.app.dependency_overrides[get_conversation_service] = lambda: (
         mock_conversation_service
@@ -1233,11 +1238,50 @@ def test_delete_conversation_success(
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
+        assert data["acp_session_deleted"] is None
+        assert data["acp_session_delete_error"] is None
 
         # Verify service was called with correct conversation ID
-        mock_conversation_service.delete_conversation.assert_called_once_with(
+        mock_conversation_service.delete_conversation_with_outcome.assert_called_once_with(
             sample_conversation_id
         )
+    finally:
+        client.app.dependency_overrides.clear()
+
+
+@pytest.mark.parametrize(
+    "deleted, error",
+    [(True, None), (False, "agent refused")],
+    ids=["deleted", "failed"],
+)
+def test_delete_conversation_reports_the_acp_session_outcome(
+    client,
+    mock_conversation_service,
+    sample_conversation_id,
+    deleted,
+    error,
+):
+    """The agent-side session outcome reaches the client (#40)."""
+
+    mock_conversation_service.delete_conversation_with_outcome.return_value = (
+        DeleteConversationResult(
+            deleted=True, acp_session_deleted=deleted, acp_session_delete_error=error
+        )
+    )
+
+    client.app.dependency_overrides[get_conversation_service] = lambda: (
+        mock_conversation_service
+    )
+
+    try:
+        response = client.delete(f"/api/conversations/{sample_conversation_id}")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "acp_session_deleted": deleted,
+            "acp_session_delete_error": error,
+        }
     finally:
         client.app.dependency_overrides.clear()
 
@@ -1247,7 +1291,9 @@ def test_delete_conversation_not_found(
 ):
     """An unknown or already deleted conversation is 404, not 400."""
 
-    mock_conversation_service.delete_conversation.return_value = False
+    mock_conversation_service.delete_conversation_with_outcome.return_value = (
+        DeleteConversationResult(deleted=False)
+    )
 
     client.app.dependency_overrides[get_conversation_service] = lambda: (
         mock_conversation_service
@@ -1259,7 +1305,7 @@ def test_delete_conversation_not_found(
         assert response.status_code == 404
 
         # Verify service was called
-        mock_conversation_service.delete_conversation.assert_called_once_with(
+        mock_conversation_service.delete_conversation_with_outcome.assert_called_once_with(
             sample_conversation_id
         )
     finally:

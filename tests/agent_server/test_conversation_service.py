@@ -5065,3 +5065,90 @@ class TestConversationServiceDeleteAcpSession:
             assert (
                 await conversation_service.delete_conversation(conversation_id) is True
             )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "supported, outcome, expected",
+        [
+            (True, "deleted", (True, None)),
+            (
+                True,
+                "failed: delete: connection closed",
+                (False, "delete: connection closed"),
+            ),
+            (True, "skipped: no session id", (None, None)),
+            (False, "deleted", (None, None)),
+        ],
+        ids=["deleted", "failed", "skipped-by-agent", "capability-missing"],
+    )
+    async def test_delete_reports_the_acp_session_outcome(
+        self, conversation_service, tmp_path, supported, outcome, expected
+    ):
+        """The outcome the client needs (#40) comes out of the delete."""
+        conversation_id, _ = self._acp_conversation(
+            conversation_service, tmp_path, supported=supported
+        )
+
+        with (
+            patch("openhands.agent_server.conversation_service.safe_rmtree"),
+            patch.object(
+                ACPAgent, "delete_acp_session_if_supported", return_value=outcome
+            ) as mock_delete,
+        ):
+            result = await conversation_service.delete_conversation_with_outcome(
+                conversation_id
+            )
+
+        assert result.deleted is True
+        assert (result.acp_session_deleted, result.acp_session_delete_error) == expected
+        assert mock_delete.called is supported
+
+    @pytest.mark.asyncio
+    async def test_agent_exception_is_reported_as_a_failure(
+        self, conversation_service, tmp_path
+    ):
+        conversation_id, _ = self._acp_conversation(
+            conversation_service, tmp_path, supported=True
+        )
+
+        with (
+            patch("openhands.agent_server.conversation_service.safe_rmtree"),
+            patch.object(
+                ACPAgent,
+                "delete_acp_session_if_supported",
+                side_effect=RuntimeError("x" * 500),
+            ),
+        ):
+            result = await conversation_service.delete_conversation_with_outcome(
+                conversation_id
+            )
+
+        assert result.deleted is True
+        assert result.acp_session_deleted is False
+        assert result.acp_session_delete_error == "x" * 200
+
+    @pytest.mark.asyncio
+    async def test_timeout_is_reported_as_a_failure(
+        self, conversation_service, tmp_path
+    ):
+        conversation_id, _ = self._acp_conversation(
+            conversation_service, tmp_path, supported=True
+        )
+
+        with (
+            patch("openhands.agent_server.conversation_service.safe_rmtree"),
+            patch(
+                "openhands.agent_server.conversation_service._ACP_SESSION_DELETE_TIMEOUT",
+                0.0,
+            ),
+            patch.object(
+                ACPAgent, "delete_acp_session_if_supported", return_value="deleted"
+            ),
+        ):
+            result = await conversation_service.delete_conversation_with_outcome(
+                conversation_id
+            )
+
+        assert result.deleted is True
+        assert result.acp_session_deleted is False
+        assert result.acp_session_delete_error == "timed out after 0s"
