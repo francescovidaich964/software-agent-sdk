@@ -1181,7 +1181,15 @@ class EventService:
         title reaches the UI (same path the auto-title uses).
         """
         stored = self.stored
-        if stored.title_source == "user" or stored.title == title:
+        # Only a title we know we wrote is ours to replace. A ``user`` title is
+        # off limits, and so is one with no provenance: a ``meta.json`` written
+        # before ``title_source`` existed cannot tell a rename from a generated
+        # title, and guessing would overwrite something the user typed.
+        replaceable = stored.title is None or stored.title_source in (
+            "auto",
+            "agent",
+        )
+        if not replaceable or stored.title == title:
             return
         try:
             await self.save_meta(

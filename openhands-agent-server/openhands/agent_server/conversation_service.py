@@ -323,6 +323,16 @@ def _same_workspace(a: LocalWorkspace, b: LocalWorkspace) -> bool:
     return Path(a.working_dir).resolve() == Path(b.working_dir).resolve()
 
 
+def _request_title_update(title: str | None) -> dict[str, Any]:
+    """The title fields for a title that arrives with a fork or child-conversation
+    request: it is the user's. Both call sites copy another conversation with
+    ``model_copy``, which skips validators, so provenance not stated here is
+    inherited from the row being copied and an agent title could then replace a
+    name the user chose.
+    """
+    return {"title": title, "title_source": "user" if title is not None else None}
+
+
 def _compose_conversation_info(
     stored: StoredConversation,
     state: ConversationState,
@@ -2088,7 +2098,7 @@ class ConversationService:
             fork_overrides: dict[str, Any] = {
                 "id": fork_conv_id,
                 "workspace": fork_workspace,
-                "title": title,
+                **_request_title_update(title),
                 "tags": tags or {},
                 "created_at": utc_now(),
                 "updated_at": utc_now(),
@@ -2186,7 +2196,7 @@ class ConversationService:
                     "id": child_id,
                     "workspace": workspace,
                     "worktree": request.isolation == "worktree",
-                    "title": request.title,
+                    **_request_title_update(request.title),
                     "metrics": None,
                     "created_at": now,
                     "updated_at": now,
@@ -2758,9 +2768,16 @@ class AutoTitleSubscriber(Subscriber):
                     self.service.stored.prompt,
                 )
                 if title and self.service.stored.title is None:
+                    # ``model_copy`` skips validators, so this is the only place
+                    # that can say the title is the server's own; without it an
+                    # agent could never rename this conversation again.
                     await self.service.save_meta(
                         self.service.stored.model_copy(
-                            update={"title": title, "updated_at": utc_now()}
+                            update={
+                                "title": title,
+                                "title_source": "auto",
+                                "updated_at": utc_now(),
+                            }
                         )
                     )
             except Exception:
