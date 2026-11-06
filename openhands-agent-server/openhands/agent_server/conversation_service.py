@@ -1917,6 +1917,8 @@ class ConversationService:
         update: dict[str, Any] = {"updated_at": utc_now()}
         if request.title is not None:
             update["title"] = request.title.strip()
+            # A rename from the UI outranks any title the agent publishes later.
+            update["title_source"] = "user"
         if request.tags is not None:
             update["tags"] = request.tags
         # Membership, not None: an explicit null removes the budget limit.

@@ -67,6 +67,7 @@ from acp.schema import (
     ReadTextFileResponse,
     ReleaseTerminalResponse,
     RequestPermissionResponse,
+    SessionInfoUpdate,
     SseMcpServer,
     TerminalOutputResponse,
     TextContentBlock,
@@ -1382,6 +1383,13 @@ class _OpenHandsACPBridge:
         # signal that the ACP subprocess is still actively working.  Set by
         # ACPAgent.step() to keep the agent-server's idle timer alive.
         self.on_activity: Any = None  # Callable[[], None] | None
+        # Agent-side rename — fired when the agent pushes a
+        # ``session_info_update`` carrying a title (claude-agent-acp titles a
+        # new session itself and re-publishes it after ``/rename``). Set by the
+        # agent-server, which owns the displayed title and decides whether the
+        # agent may replace it; bound for the conversation's lifetime because
+        # the title arrives while the session loads, not only inside a turn.
+        self.on_session_title: Any = None  # Callable[[str], None] | None
         # Secret masker — set per turn by ACPAgent to
         # ``state.secret_registry.mask_secrets_in_output``. Applied to streamed
         # text chunks and tool-call raw_input/raw_output/content before they
@@ -1427,6 +1435,7 @@ class _OpenHandsACPBridge:
         self._masking_error = None
         # Note: telemetry state (_last_cost, _context_window, _last_activity_signal,
         # etc.) is intentionally NOT cleared — it accumulates across turns.
+        # Neither is on_session_title, which is bound for the conversation.
 
     def arm_activity_clock(self) -> None:
         """Mark "now" as the last activity for the idle-timeout watchdog.
@@ -1636,6 +1645,23 @@ class _OpenHandsACPBridge:
                 self.trace.tool_finished(target)
                 self._emit_tool_call_event(target)
             self._maybe_signal_activity()
+        elif isinstance(update, SessionInfoUpdate):
+            # The agent renamed its own session: claude-agent-acp titles a new
+            # session from the first prompt and re-publishes the title after a
+            # ``/rename``. Offered to the consumer (``on_session_title``), which
+            # owns the displayed title and decides whether the agent may replace
+            # it — so no de-duplication here, because a title published before
+            # any consumer was listening still has to reach one. Masked like a
+            # tool-call title: agent-authored text can echo an injected
+            # credential and this lands in the conversation list.
+            title = self._mask_value((update.title or "").strip())
+            # A null title means "clear it" (not our title to clear) and the
+            # ``_meta``-only frames this update type also carries have none.
+            if title and self.on_session_title is not None:
+                try:
+                    self.on_session_title(title)
+                except Exception:
+                    logger.debug("on_session_title callback failed", exc_info=True)
         else:
             logger.debug("ACP session update: %s", type(update).__name__)
 
@@ -2091,6 +2117,10 @@ class ACPAgent(AgentBase):
     # Callback to signal that the ACP subprocess is actively working.
     # Injected by the agent-server to call update_last_execution_time().
     _on_activity: Any = PrivateAttr(default=None)  # Callable[[], None] | None
+    # Callback for an agent-side rename (ACP ``session_info_update`` with a
+    # title). Injected by the agent-server to adopt it as the conversation
+    # title; the agent itself has no title to change.
+    _on_session_title: Any = PrivateAttr(default=None)  # Callable[[str], None] | None
     # Suffix rendered once at session start from agent_context + secret_registry.
     # "unused"               — no agent_context or empty suffix
     # "pending_first_prompt" — new session; inject into first user message
@@ -3097,6 +3127,12 @@ class ACPAgent(AgentBase):
         # session updates AND for ask_agent() forks, which run on the shared
         # client and may fire while no step()/astep() turn is active.
         client.mask = state.secret_registry.mask_secrets_in_output
+        # The agent's own rename is conversation-stable like the masker:
+        # claude-agent-acp publishes the session title while the session is
+        # loaded, before any turn has started, so binding it only per-turn
+        # here would drop it. ``_reset_client_for_turn`` re-binds it, so a hook
+        # the agent-server injects after this launch still lands next turn.
+        client.on_session_title = self._on_session_title
         self._bind_file_credential_masking()
 
         # Build the subprocess environment. Precedence, highest first:
@@ -3562,6 +3598,7 @@ class ACPAgent(AgentBase):
             self._emit_text_segment, on_event
         )
         self._client.on_activity = self._on_activity
+        self._client.on_session_title = self._on_session_title
         # Start the idle-timeout clock fresh for this attempt so the deadline
         # is measured from the send (or retry), not from a stale value.
         self._client.arm_activity_clock()

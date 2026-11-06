@@ -10588,3 +10588,149 @@ class TestUnperformableAuthMethodLogging:
 
         assert "session creation may fail" in caplog.text
         assert "GEMINI_API_KEY is unset" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Agent-pushed session titles (ACP session_info_update)
+# ---------------------------------------------------------------------------
+
+
+class TestACPSessionTitleUpdate:
+    """An ACP agent renames its own session with a ``session_info_update``
+    carrying a ``title`` (claude-agent-acp titles a new session from the first
+    prompt and re-publishes it after ``/rename``). The bridge relays it to the
+    consumer and ignores the title-less frames the same agents send for
+    ``_meta`` extensions; deciding who may own the title is the consumer's job.
+    """
+
+    @staticmethod
+    def _info(payload: dict[str, Any]):
+        from acp.schema import SessionInfoUpdate
+
+        return SessionInfoUpdate.model_validate(
+            {"sessionUpdate": "session_info_update", **payload}
+        )
+
+    @staticmethod
+    def _bridge() -> tuple[_OpenHandsACPBridge, list[str]]:
+        client = _OpenHandsACPBridge()
+        relayed: list[str] = []
+        client.on_session_title = relayed.append
+        return client, relayed
+
+    @pytest.mark.asyncio
+    async def test_agent_title_is_relayed(self):
+        client, relayed = self._bridge()
+
+        await client.session_update("s1", self._info({"title": "Fix the login bug"}))
+
+        assert relayed == ["Fix the login bug"]
+
+    @pytest.mark.asyncio
+    async def test_the_title_is_masked_like_a_tool_call_title(self):
+        """Agent-authored text can echo an injected credential, and what is
+        relayed here ends up in the conversation list."""
+        client, relayed = self._bridge()
+        client.mask = lambda text: text.replace("sk-secret", "[masked]")
+
+        await client.session_update(
+            "s1", self._info({"title": "Use sk-secret to log in"})
+        )
+
+        assert relayed == ["Use [masked] to log in"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("title", [None, "", "   "])
+    async def test_blank_title_is_ignored(self, title):
+        """A null title means "clear it" — not ours to clear — and whitespace
+        is nothing to adopt."""
+        client, relayed = self._bridge()
+
+        await client.session_update("s1", self._info({"title": title}))
+
+        assert relayed == []
+
+    @pytest.mark.asyncio
+    async def test_meta_only_frame_is_ignored(self):
+        """claude-agent-acp also sends ``session_info_update`` carrying only
+        ``_meta`` (retry state, file-change reports); that is not a rename."""
+        client, relayed = self._bridge()
+
+        await client.session_update(
+            "s1", self._info({"_meta": {"air/goal": "keep going"}})
+        )
+
+        assert relayed == []
+
+    @pytest.mark.asyncio
+    async def test_a_later_agent_title_replaces_the_earlier_one(self):
+        client, relayed = self._bridge()
+
+        await client.session_update("s1", self._info({"title": "First title"}))
+        await client.session_update("s1", self._info({"title": "Renamed by /rename"}))
+
+        assert relayed == ["First title", "Renamed by /rename"]
+
+    @pytest.mark.asyncio
+    async def test_a_republished_title_is_relayed_again(self):
+        """A resume re-publishes the current title, and a consumer that joined
+        or restarted since then needs to hear it again; the consumer that
+        already shows it writes nothing (see the agent-server tests)."""
+        client, relayed = self._bridge()
+
+        await client.session_update("s1", self._info({"title": "Stable title"}))
+        await client.session_update("s1", self._info({"title": "Stable title"}))
+
+        assert relayed == ["Stable title", "Stable title"]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_consumer_does_not_break_the_update_stream(self):
+        client = _OpenHandsACPBridge()
+        client.on_session_title = MagicMock(side_effect=RuntimeError("sink is gone"))
+
+        await client.session_update("s1", self._info({"title": "Any title"}))
+
+        client.on_session_title.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_consumer_still_consumes_the_update(self):
+        """An unrouted title is dropped, not raised: the update stream must
+        keep running for the rest of the turn."""
+        client = _OpenHandsACPBridge()
+
+        await client.session_update("s1", self._info({"title": "Nobody listening"}))
+
+    def test_reset_client_for_turn_rebinds_the_hook(self, tmp_path):
+        """The per-turn wiring re-reads the hook, so one the agent-server
+        injects after the session launched still reaches the bridge."""
+        agent = _make_agent()
+        agent._client = _OpenHandsACPBridge()
+        hook = MagicMock()
+        agent._on_session_title = hook
+
+        agent._reset_client_for_turn(None, lambda *_args: None)
+
+        assert agent._client.on_session_title is hook
+
+    def test_the_hook_is_bound_for_the_conversation_lifetime(self, tmp_path):
+        """The bridge binds the hook when the session starts, because
+        claude-agent-acp publishes the title while the session loads — before
+        the first turn wires the per-turn callbacks."""
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        hook = MagicMock()
+        agent._on_session_title = hook
+
+        try:
+            TestACPSessionIdPersistence._patched_start_acp_server(
+                agent,
+                state,
+                conn=TestACPSessionIdPersistence._make_conn(),
+            )
+        finally:
+            agent._unregister_atexit_cleanup()
+            assert agent._executor is not None
+            agent._executor.close()
+            agent._executor = None
+
+        assert agent._client.on_session_title is hook

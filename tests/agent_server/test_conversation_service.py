@@ -2848,6 +2848,8 @@ class TestConversationServiceUpdateConversation:
         # Verify update was successful
         assert result is True
         assert mock_service.stored.title == new_title
+        # The rename came from the UI, so no agent title may replace it.
+        assert mock_service.stored.title_source == "user"
         mock_service.save_meta.assert_called_once()
 
     @pytest.mark.asyncio
@@ -4163,6 +4165,132 @@ class TestACPActivityHeartbeatWiring:
         # Should not raise and should not set any attribute
         EventService._setup_acp_activity_heartbeat(service, agent)
         assert not hasattr(agent, "_on_activity")
+
+
+class TestACPSessionTitleAdoption:
+    """EventService adopts a title the ACP agent publishes for its session
+    (claude-agent-acp titles a new session from the first prompt and re-publishes
+    it after ``/rename``), but never over one the user renamed to themselves.
+    """
+
+    @staticmethod
+    def _stored() -> StoredConversation:
+        return StoredConversation(
+            id=uuid4(),
+            workspace=LocalWorkspace(working_dir="workspace/project"),
+            confirmation_policy=NeverConfirm(),
+            initial_message=None,
+            metrics=None,
+        )
+
+    @staticmethod
+    def _generated(title: str) -> StoredConversation:
+        """The auto-title shape: ``AutoTitleSubscriber`` writes it with
+        ``model_copy``, which skips validators, so it carries no provenance."""
+        return TestACPSessionTitleAdoption._stored().model_copy(update={"title": title})
+
+    @staticmethod
+    def _service(stored: StoredConversation) -> AsyncMock:
+        service = AsyncMock(spec=EventService)
+        service.stored = stored
+        _adopt_saved_meta(service)
+        return service
+
+    def test_a_title_supplied_at_creation_is_the_users(self):
+        """A conversation created or forked with a title states no provenance,
+        and so does an older ``meta.json``: both are treated as the user's."""
+        stored = self._stored().model_copy(update={"title": "Chosen at creation"})
+
+        assert (
+            StoredConversation.model_validate(
+                json.loads(stored.model_dump_json())
+            ).title_source
+            == "user"
+        )
+
+    @pytest.mark.asyncio
+    async def test_agent_title_is_adopted_over_a_generated_one(self):
+        service = self._service(self._generated("Fix the login bug"))
+
+        await EventService._adopt_acp_session_title(service, "Renamed by Claude")
+
+        assert service.stored.title == "Renamed by Claude"
+        assert service.stored.title_source == "agent"
+        service.save_meta.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_agent_title_is_adopted_when_there_is_none_yet(self):
+        service = self._service(self._stored())
+
+        await EventService._adopt_acp_session_title(service, "Renamed by Claude")
+
+        assert service.stored.title == "Renamed by Claude"
+        assert service.stored.title_source == "agent"
+
+    @pytest.mark.asyncio
+    async def test_a_second_agent_title_replaces_the_first(self):
+        service = self._service(
+            self._generated("First title").model_copy(update={"title_source": "agent"})
+        )
+
+        await EventService._adopt_acp_session_title(service, "Renamed by /rename")
+
+        assert service.stored.title == "Renamed by /rename"
+        service.save_meta.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_user_title_is_never_replaced(self):
+        stored = self._stored().model_copy(update={"title": "My own name"})
+        service = self._service(
+            StoredConversation.model_validate(json.loads(stored.model_dump_json()))
+        )
+        assert service.stored.title_source == "user"
+
+        await EventService._adopt_acp_session_title(service, "Renamed by Claude")
+
+        assert service.stored.title == "My own name"
+        service.save_meta.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_republished_title_writes_nothing(self):
+        """A resume re-publishes the title the conversation already shows, so
+        the round-trip must not rewrite ``meta.json``."""
+        service = self._service(self._generated("Stable title"))
+
+        await EventService._adopt_acp_session_title(service, "Stable title")
+
+        service.save_meta.assert_not_called()
+
+    def test_a_title_is_dropped_when_the_loop_is_gone(self):
+        """The agent fires this from its own thread during teardown as well;
+        without a running loop there is nothing to write on."""
+        service = MagicMock()
+        service.stored = self._stored()
+        service.save_meta = AsyncMock()
+        service._main_loop = None
+
+        EventService._on_acp_session_title(service, "Renamed by Claude")
+
+        service.save_meta.assert_not_called()
+        assert service.stored.title is None
+
+    def test_setup_wires_the_hook_on_an_acp_agent(self):
+        """_setup_acp_session_title should hand the agent the adoption hook."""
+        service = self._service(self._stored())
+        agent = ACPAgent(acp_command=["echo", "test"])
+        assert agent._on_session_title is None
+
+        EventService._setup_acp_session_title(service, agent)
+
+        assert agent._on_session_title == service._on_acp_session_title
+
+    def test_setup_skips_a_non_acp_agent(self):
+        service = self._service(self._stored())
+        agent = Agent(llm=LLM(model="test-model"))
+
+        EventService._setup_acp_session_title(service, agent)
+
+        assert not hasattr(agent, "_on_session_title")
 
 
 @pytest.mark.asyncio
