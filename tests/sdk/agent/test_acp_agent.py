@@ -10734,3 +10734,69 @@ class TestACPSessionTitleUpdate:
             agent._executor = None
 
         assert agent._client.on_session_title is hook
+
+
+# ---------------------------------------------------------------------------
+# ACP protocol version negotiation
+# ---------------------------------------------------------------------------
+
+
+class TestACPProtocolVersion:
+    """Guards around the ACP protocol version this client asks for, and what it
+    does with the version the agent answers with.
+
+    ``_start_acp_server`` requests version 1 and reads only ``agent_info`` and
+    the capability lists out of the response, so today the answered version
+    changes nothing. Issue #36 is the mirror-image fault (an agent that
+    negotiates v2 and then keeps speaking v1 shapes), so both halves are
+    pinned: a client bump has to be deliberate, and a change in how the answer
+    is treated has to be deliberate too.
+    """
+
+    @staticmethod
+    def _handshake(tmp_path, answered_version: int) -> dict:
+        """Run the real ``_start_acp_server`` against a mocked transport whose
+        agent answers ``initialize`` with ``answered_version``."""
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        conn = TestACPSessionIdPersistence._make_conn(new_session_id="sess-v")
+        conn.initialize.return_value.protocol_version = answered_version
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        handshake = [
+            name
+            for name in (
+                "initialize",
+                "new_session",
+                "load_session",
+                "set_session_mode",
+                "set_session_model",
+                "authenticate",
+            )
+            if getattr(conn, name).await_count
+        ]
+        return {
+            "requested_version": conn.initialize.await_args.kwargs["protocol_version"],
+            "handshake": handshake,
+            "session_id": agent._session_id,
+        }
+
+    def test_the_client_requests_protocol_version_1(self, tmp_path):
+        """The request side, so raising it is a decision someone has to make."""
+        assert self._handshake(tmp_path, answered_version=1)["requested_version"] == 1
+
+    def test_the_answered_version_changes_nothing_today(self, tmp_path):
+        """Whatever the agent answers, the client runs the same v1 handshake.
+
+        An agent that answers version 2 is treated exactly like one that answers
+        1: same calls, same order, session starts. If the client ever honours
+        the negotiated version - refusing, warning, or switching message shapes -
+        the two arms stop matching and this test says so.
+        """
+        answered_v1 = self._handshake(tmp_path / "v1", answered_version=1)
+        answered_v2 = self._handshake(tmp_path / "v2", answered_version=2)
+
+        assert answered_v1 == answered_v2
+        assert answered_v1["session_id"] == "sess-v"
+        assert answered_v1["handshake"][0] == "initialize"
