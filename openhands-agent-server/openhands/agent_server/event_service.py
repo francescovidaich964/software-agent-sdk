@@ -28,6 +28,7 @@ from openhands.agent_server.models import (
 )
 from openhands.agent_server.pub_sub import PubSub, Subscriber
 from openhands.agent_server.server_details_router import update_last_execution_time
+from openhands.agent_server.utils import utc_now
 from openhands.sdk import LLM, AgentBase, Event, Message, TextContent, get_logger
 from openhands.sdk.agent import ACPAgent
 from openhands.sdk.agent.acp_agent import ACTIVITY_SIGNAL_INTERVAL
@@ -1144,6 +1145,62 @@ class EventService:
         if isinstance(agent, ACPAgent):
             agent._on_activity = update_last_execution_time
 
+    def _setup_acp_session_title(self, agent: AgentBase) -> None:
+        """Wire an ACP agent's own session title to this conversation.
+
+        An agent can rename its session from its own side: claude-agent-acp
+        titles a new session from the first prompt and both it and a ``/rename``
+        inside the agent publish the result as an ACP ``session_info_update``.
+        The bridge forwards the title to ``_on_acp_session_title``; whether it
+        may replace what the user sees is decided there, not by the agent.
+        """
+        if isinstance(agent, ACPAgent):
+            agent._on_session_title = self._on_acp_session_title
+
+    def _on_acp_session_title(self, title: str) -> None:
+        """Receive an agent-published title from the ACP bridge's own thread.
+
+        The write belongs to the conversation loop, so it is handed over there;
+        a loop that is already gone (teardown, where a title can still arrive
+        with the session load) drops it rather than raising on the bridge.
+        """
+        main_loop = self._main_loop
+        if main_loop is None or not main_loop.is_running():
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._adopt_acp_session_title(title), main_loop
+        )
+
+    async def _adopt_acp_session_title(self, title: str) -> None:
+        """Persist an agent-published title, never over one the user renamed to.
+
+        Reads ``stored`` on the loop just before writing, so a rename that lands
+        while this is queued still wins, and skips the rewrite when the title is
+        already what the conversation shows — an agent re-publishes it on every
+        resume. Stored metadata is polled by the sidebar, which is how the new
+        title reaches the UI (same path the auto-title uses).
+        """
+        stored = self.stored
+        if stored.title_source == "user" or stored.title == title:
+            return
+        try:
+            await self.save_meta(
+                stored.model_copy(
+                    update={
+                        "title": title,
+                        "title_source": "agent",
+                        "updated_at": utc_now(),
+                    }
+                )
+            )
+        except Exception:
+            # A title is cosmetic; a refused or failed write (lost lease
+            # ownership) must not surface as a conversation error.
+            logger.warning(
+                f"Could not store agent title for conversation {stored.id}",
+                exc_info=True,
+            )
+
     def _signal_stream_activity(self) -> None:
         """Refresh the runtime idle timer while a completion streams.
 
@@ -1420,6 +1477,10 @@ class EventService:
         # agent-server's idle timer and prevent runtime-api from killing
         # the pod during long conn.prompt() calls.
         self._setup_acp_activity_heartbeat(self._conversation.agent)
+
+        # Let an agent that renames its own session rename the conversation as
+        # well (see _setup_acp_session_title for who may actually own it).
+        self._setup_acp_session_title(self._conversation.agent)
 
         # Any conversation loaded from disk with RUNNING status is stale. Active
         # split-brain resumes are prevented earlier by the lease claim itself, so if
