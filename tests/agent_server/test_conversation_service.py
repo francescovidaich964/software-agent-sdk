@@ -4976,3 +4976,92 @@ async def test_settings_launch_builds_the_agent_once(conversation_service, tmp_p
 
     create_agent.assert_called_once()
     assert "browser_tool_set" in [t.name for t in captured["agent"].tools]
+
+
+class TestConversationServiceDeleteAcpSession:
+    """Deleting a conversation also deletes the agent's own ACP session (#40)."""
+
+    @staticmethod
+    def _acp_conversation(conversation_service, tmp_path, *, supported: bool):
+        conversation_id = uuid4()
+        mock_service = AsyncMock(spec=EventService)
+        mock_service.conversation_dir = str(tmp_path)
+        mock_service.stored = StoredConversation(
+            id=conversation_id,
+            workspace=LocalWorkspace(working_dir=str(tmp_path)),
+            confirmation_policy=NeverConfirm(),
+            initial_message=None,
+            metrics=None,
+            created_at=datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC),
+            updated_at=datetime(2025, 1, 1, 12, 30, 0, tzinfo=UTC),
+        )
+        state = ConversationState(
+            id=conversation_id,
+            agent=ACPAgent(acp_command=["echo", "test"]),
+            workspace=mock_service.stored.workspace,
+            execution_status=ConversationExecutionStatus.IDLE,
+            confirmation_policy=NeverConfirm(),
+        )
+        state.agent_state["acp_session_id"] = "ses-9"
+        state.agent_state["acp_session_delete_supported"] = supported
+        mock_service.get_state.return_value = state
+        conversation_service._event_services[conversation_id] = mock_service
+        return conversation_id, state
+
+    @pytest.mark.asyncio
+    async def test_advertised_capability_deletes_the_stored_session(
+        self, conversation_service, tmp_path
+    ):
+        conversation_id, state = self._acp_conversation(
+            conversation_service, tmp_path, supported=True
+        )
+
+        with (
+            patch("openhands.agent_server.conversation_service.safe_rmtree"),
+            patch.object(
+                ACPAgent,
+                "delete_acp_session_if_supported",
+                return_value="deleted",
+            ) as mock_delete,
+        ):
+            assert (
+                await conversation_service.delete_conversation(conversation_id) is True
+            )
+
+        mock_delete.assert_called_once_with("ses-9", state=state)
+
+    @pytest.mark.asyncio
+    async def test_missing_capability_is_skipped(self, conversation_service, tmp_path):
+        conversation_id, _ = self._acp_conversation(
+            conversation_service, tmp_path, supported=False
+        )
+
+        with (
+            patch("openhands.agent_server.conversation_service.safe_rmtree"),
+            patch.object(ACPAgent, "delete_acp_session_if_supported") as mock_delete,
+        ):
+            assert (
+                await conversation_service.delete_conversation(conversation_id) is True
+            )
+
+        mock_delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_agent_failure_does_not_block_the_delete(
+        self, conversation_service, tmp_path
+    ):
+        conversation_id, _ = self._acp_conversation(
+            conversation_service, tmp_path, supported=True
+        )
+
+        with (
+            patch("openhands.agent_server.conversation_service.safe_rmtree"),
+            patch.object(
+                ACPAgent,
+                "delete_acp_session_if_supported",
+                side_effect=RuntimeError("agent exploded"),
+            ),
+        ):
+            assert (
+                await conversation_service.delete_conversation(conversation_id) is True
+            )

@@ -2101,6 +2101,7 @@ class ACPAgent(AgentBase):
     _skill_locations: dict[str, Path] = PrivateAttr(default_factory=dict)
     _skills_root: Path | None = PrivateAttr(default=None)
     _additional_directories_supported: bool = PrivateAttr(default=False)
+    _session_delete_supported: bool = PrivateAttr(default=False)
     _restart_session_on_next_turn: bool = PrivateAttr(default=False)
     # Stream identity for the turn in flight; see stream_context.py. Held on
     # the agent rather than threaded through the finalizers because the ACP
@@ -2532,6 +2533,10 @@ class ACPAgent(AgentBase):
             # load_session omits the model block reapplies the model via the
             # right call instead of defaulting to set_session_model.
             "acp_model_via_config_option": self._model_via_config_option,
+            # Whether the agent advertised ``session/delete`` — persisted so
+            # conversation deletion can ask the agent to forget this session
+            # without spawning it just to read the capability back (#40).
+            "acp_session_delete_supported": self._session_delete_supported,
         }
         # When starting a fresh session, clear stale suffix marker so the next
         # launch knows to re-inject it (PR behavior: suffix state is per-session).
@@ -3295,6 +3300,9 @@ class ACPAgent(AgentBase):
             self._additional_directories_supported = (
                 session_caps is not None
                 and session_caps.additional_directories is not None
+            )
+            self._session_delete_supported = (
+                session_caps is not None and session_caps.delete is not None
             )
             acp_mcp_servers = _mcp_config_to_acp_servers(self.mcp_config, mcp_caps)
             if acp_mcp_servers:
@@ -4766,6 +4774,75 @@ class ACPAgent(AgentBase):
             provider.key if provider else "unknown",
             _fingerprint_session_id(self._session_id),
         )
+
+    def delete_acp_session_if_supported(
+        self,
+        session_id: str | None = None,
+        *,
+        state: ConversationState | None = None,
+        timeout: float = 10.0,
+    ) -> str:
+        """Ask the agent to forget one of its ACP sessions (``session/delete``).
+
+        Deleting an OpenHands conversation is invisible to the agent process, so
+        without this call the agent's own session store keeps every session the
+        user ever deleted.  The method is not in the typed client, so it goes out
+        as a raw request like :meth:`_ACPClientConnection.set_session_model`.
+
+        Best-effort by contract: it never raises, because an agent that refuses or
+        is unreachable is no reason to fail the conversation delete.  When the
+        conversation is not running, the agent is started transiently (bounded by
+        ``acp_startup_timeout`` for startup plus ``timeout`` for the call) using
+        ``state`` and closed again.
+
+        Args:
+            session_id: Session to delete; defaults to this agent's current one.
+            state: Conversation state, required to start a stopped agent.
+            timeout: Seconds to wait for the ``session/delete`` response.
+
+        Returns:
+            A short, log-friendly outcome; ``"deleted"`` on success.
+        """
+        target = session_id or self._session_id
+        if not target:
+            return "skipped: no session id"
+
+        started_transiently = False
+        if self._conn is None:
+            if state is None:
+                return "skipped: agent not running"
+            try:
+                with state:
+                    self.init_state(state, on_event=lambda _event: None)
+                started_transiently = True
+            except Exception as exc:
+                return f"failed: start: {_acp_error_detail(exc, state.secret_registry)}"
+
+        try:
+            if not self._session_delete_supported:
+                return "skipped: agent does not advertise session/delete"
+            conn, executor = self._conn, self._executor
+            if conn is None or executor is None:
+                return "failed: no ACP connection"
+
+            async def _delete_session() -> None:
+                await conn.send_request("session/delete", {"sessionId": target})
+
+            try:
+                executor.run_async(_delete_session, timeout=timeout)
+            except Exception as exc:
+                return f"failed: delete: {_acp_error_detail(exc)}"
+            logger.info(
+                "Deleted ACP session %s from the agent",
+                _fingerprint_session_id(target),
+            )
+            return "deleted"
+        finally:
+            if started_transiently:
+                try:
+                    self.close()
+                except Exception as exc:
+                    logger.debug("Error closing transient ACP agent: %s", exc)
 
     def close(self) -> None:
         """Terminate the ACP subprocess and clean up resources."""

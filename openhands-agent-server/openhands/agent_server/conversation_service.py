@@ -99,6 +99,11 @@ if TYPE_CHECKING:
 
 _AUTOMATION_TAG_KEYS = ("automationtrigger", "automationid", "automationrunid")
 
+# Wall-clock budget for asking an ACP agent to forget its session during
+# conversation deletion. Startup of a stopped agent is the slow part; past this
+# the delete proceeds anyway and the agent-side call is left to its own timeouts.
+_ACP_SESSION_DELETE_TIMEOUT = 60.0
+
 
 class CredentialBindingActivationRequired(RuntimeError):
     pass
@@ -1848,6 +1853,7 @@ class ConversationService:
                 return False
 
             # Notify conversation webhooks about the stopped conversation before closing
+            state: ConversationState | None = None
             try:
                 state = await event_service.get_state()
                 conversation_info = _compose_webhook_conversation_info(
@@ -1861,6 +1867,25 @@ class ConversationService:
                 logger.warning(
                     f"Failed to notify webhooks for conversation {conversation_id}: {e}"
                 )
+
+            # Tell the agent to forget its own session while its state is still
+            # readable (and, for a running conversation, before we close it).
+            if state is not None:
+                try:
+                    await asyncio.wait_for(
+                        self._delete_acp_session_if_supported(conversation_id, state),
+                        timeout=_ACP_SESSION_DELETE_TIMEOUT,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        f"Timed out deleting the ACP session for conversation "
+                        f"{conversation_id}; continuing with the delete."
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to delete the ACP session for conversation "
+                        f"{conversation_id}: {e}"
+                    )
 
             # Close the event service
             try:
@@ -1895,6 +1920,38 @@ class ConversationService:
 
             logger.info(f"Successfully deleted conversation {conversation_id}")
             return True
+
+    async def _delete_acp_session_if_supported(
+        self, conversation_id: UUID, state: ConversationState
+    ) -> None:
+        """Ask an ACP agent to forget the session of a conversation being deleted.
+
+        The agent keeps its own session store (opencode's session DB, Claude's
+        transcripts) that OpenHands deletion never reaches, so those sessions
+        pile up as orphans (#40).  Outcome is logged only: the conversation
+        delete must not depend on the agent cooperating.
+        """
+        agent = state.agent
+        session_id = state.agent_state.get("acp_session_id")
+        # The capability is persisted when the session starts, so an agent that
+        # never advertised ``session/delete`` is skipped without being spawned
+        # just to find that out.  Conversations from before this existed also
+        # lack the flag and are skipped.
+        if (
+            not isinstance(agent, ACPAgent)
+            or not isinstance(session_id, str)
+            or not state.agent_state.get("acp_session_delete_supported")
+        ):
+            logger.debug(
+                f"Skipping ACP session delete for conversation {conversation_id}"
+            )
+            return
+
+        # Blocks on the agent's own event-loop thread, so keep it off this loop.
+        outcome = await asyncio.to_thread(
+            agent.delete_acp_session_if_supported, session_id, state=state
+        )
+        logger.info(f"ACP session delete for conversation {conversation_id}: {outcome}")
 
     async def update_conversation(
         self, conversation_id: UUID, request: UpdateConversationRequest
